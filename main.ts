@@ -493,17 +493,17 @@ export default class VoiceToTextPlugin extends Plugin {
 
 	private updateStatusBar(recording: boolean) {
 		if (!this.statusBarItem) return;
-		this.statusBarItem.empty();
-		this.statusBarItem.addClass("vtt-statusbar");
-		this.statusBarItem.innerHTML = recording
-			? `${REC_SVG}<span>Recording</span>`
-			: `${MIC_SVG}<span>Voice to Text</span>`;
-		this.statusBarItem.setAttribute(
-			"title",
-			recording
-				? "Voice to Text: recording in progress"
-				: `Voice to Text: hold ${this.settings.hotkey} to record`
-		);
+		// this.statusBarItem.empty();
+		// this.statusBarItem.addClass("vtt-statusbar");
+		// this.statusBarItem.innerHTML = recording
+		// 	? `${REC_SVG}<span>Recording</span>`
+		// 	: `${MIC_SVG}<span>Voice to Text</span>`;
+		// this.statusBarItem.setAttribute(
+		// 	"title",
+		// 	recording
+		// 		? "Voice to Text: recording in progress"
+		// 		: `Voice to Text: hold ${this.settings.hotkey} to record`
+		// );
 	}
 
 	// ── Settings persistence ──────────────────

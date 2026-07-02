@@ -1,7 +1,7 @@
 {
   "id": "voice-to-text",
   "name": "Voice to Text",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "minAppVersion": "1.4.0",
   "description": "Push-to-talk voice transcription using Deepgram or Groq. Hold a hotkey to record, release to transcribe and insert at cursor.",
   "author": "SATOSprod",

@@ -1,6 +1,6 @@
 {
   "name": "obsidian-voice-to-text",
-  "version": "2.1.1",
+  "version": "2.1.2",
   "description": "Push-to-talk voice transcription plugin for Obsidian using Deepgram or Groq",
   "main": "main.js",
   "scripts": {

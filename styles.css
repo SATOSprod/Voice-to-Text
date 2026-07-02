@@ -143,3 +143,9 @@
   font-family: var(--font-monospace);
   font-size: 12px;
 }
+
+/* ── Clear hotkey button ── */
+.vtt-clear-btn {
+  font-size: 12px;
+  padding: 2px 8px;
+}

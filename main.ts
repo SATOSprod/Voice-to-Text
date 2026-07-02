@@ -7,6 +7,7 @@ import {
 	PluginSettingTab,
 	Setting,
 	normalizePath,
+	requestUrl,
 } from "obsidian";
 
 // ─────────────────────────────────────────────
@@ -82,6 +83,23 @@ const DEFAULT_SETTINGS: VoiceToTextSettings = {
 	audioSaveFolder: "voice-recordings",
 };
 
+interface DeepgramResponse {
+	results?: {
+		channels?: Array<{
+			alternatives?: Array<{ transcript?: string }>;
+		}>;
+	};
+}
+
+interface GroqResponse {
+	text?: string;
+}
+
+function errorMessage(e: unknown): string {
+	if (e instanceof Error) return e.message;
+	return String(e);
+}
+
 // ─────────────────────────────────────────────
 // SVG icon helpers
 // ─────────────────────────────────────────────
@@ -90,7 +108,7 @@ const DEFAULT_SETTINGS: VoiceToTextSettings = {
 function keyIcon(key: string): string {
 	switch (key) {
 		case "Meta":
-			// OS-independent: use ◆ / ⊞-like glyph
+			// OS-independent: use grid-like glyph
 			return `<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" xmlns="http://www.w3.org/2000/svg"><rect x="1" y="1" width="6" height="6" rx="1"/><rect x="9" y="1" width="6" height="6" rx="1"/><rect x="1" y="9" width="6" height="6" rx="1"/><rect x="9" y="9" width="6" height="6" rx="1"/></svg>`;
 		case "Control":
 		case "Ctrl":
@@ -104,9 +122,14 @@ function keyIcon(key: string): string {
 	}
 }
 
-const MIC_SVG = `<svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" xmlns="http://www.w3.org/2000/svg"><rect x="9" y="2" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0"/><line x1="12" y1="18" x2="12" y2="22"/><line x1="8" y1="22" x2="16" y2="22"/></svg>`;
-
-const REC_SVG = `<svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" xmlns="http://www.w3.org/2000/svg"><circle cx="12" cy="12" r="6"/></svg>`;
+/** Safely appends an SVG string as a DOM node, without innerHTML */
+function appendSvg(target: HTMLElement, svg: string): void {
+	const doc = new DOMParser().parseFromString(svg, "image/svg+xml");
+	const node = doc.documentElement;
+	if (node && node.nodeName.toLowerCase() === "svg") {
+		target.appendChild(target.ownerDocument.importNode(node, true));
+	}
+}
 
 // ─────────────────────────────────────────────
 // Logger — writes to file, not console
@@ -139,13 +162,13 @@ class FileLogger {
 			} else {
 				await this.app.vault.adapter.write(this.filePath, line);
 			}
-		} catch (e) {
+		} catch (e: unknown) {
 			// last resort: console only if file write fails
-			console.error("[VoiceToText] Log write failed:", e);
+			console.error("[VoiceToText] Log write failed:", errorMessage(e));
 		}
 	}
 
-	update(enabled: boolean, folder: string) {
+	update(enabled: boolean, folder: string): void {
 		this.enabled = enabled;
 		this.folder = normalizePath(folder);
 		const date = new Date().toISOString().slice(0, 10);
@@ -216,9 +239,42 @@ async function saveWavFile(
 		const filePath = normalizePath(`${folderPath}/${fileName}`);
 		await app.vault.adapter.writeBinary(filePath, new Uint8Array(wavBuffer));
 		await logger.log("Saved audio to", filePath);
-	} catch (e) {
-		await logger.log("Failed to save WAV:", e);
+	} catch (e: unknown) {
+		await logger.log("Failed to save WAV:", errorMessage(e));
 	}
+}
+
+// ─────────────────────────────────────────────
+// Multipart/form-data helper (for requestUrl)
+// ─────────────────────────────────────────────
+
+function buildMultipartFormData(
+	fields: Record<string, string>,
+	fileField: { name: string; filename: string; contentType: string; data: ArrayBuffer }
+): { contentType: string; body: ArrayBuffer } {
+	const boundary = `----VoiceToTextBoundary${Date.now().toString(16)}`;
+	const encoder = new TextEncoder();
+	const parts: Uint8Array[] = [];
+
+	for (const [key, value] of Object.entries(fields)) {
+		parts.push(encoder.encode(
+			`--${boundary}\r\nContent-Disposition: form-data; name="${key}"\r\n\r\n${value}\r\n`
+		));
+	}
+	parts.push(encoder.encode(
+		`--${boundary}\r\nContent-Disposition: form-data; name="${fileField.name}"; filename="${fileField.filename}"\r\nContent-Type: ${fileField.contentType}\r\n\r\n`
+	));
+	parts.push(new Uint8Array(fileField.data));
+	parts.push(encoder.encode(`\r\n--${boundary}--\r\n`));
+
+	const totalLength = parts.reduce((sum, p) => sum + p.byteLength, 0);
+	const body = new Uint8Array(totalLength);
+	let offset = 0;
+	for (const p of parts) {
+		body.set(p, offset);
+		offset += p.byteLength;
+	}
+	return { contentType: `multipart/form-data; boundary=${boundary}`, body: body.buffer };
 }
 
 // ─────────────────────────────────────────────
@@ -244,21 +300,23 @@ async function transcribeDeepgram(
 	const url = `https://api.deepgram.com/v1/listen?${new URLSearchParams(params)}`;
 	await logger.log("Sending to Deepgram:", url);
 
-	const response = await fetch(url, {
+	const response = await requestUrl({
+		url,
 		method: "POST",
 		headers: {
 			Authorization: `Token ${settings.deepgramApiKey}`,
 			"Content-Type": "audio/wav",
 		},
 		body: wavBuffer,
+		throw: false,
 	});
-	if (!response.ok) {
-		const errText = await response.text();
-		throw new Error(`Deepgram error ${response.status}: ${errText}`);
+
+	if (response.status < 200 || response.status >= 300) {
+		throw new Error(`Deepgram error ${response.status}: ${response.text}`);
 	}
-	const data = await response.json();
+	const data = response.json as unknown as DeepgramResponse;
 	await logger.log("Deepgram response:", JSON.stringify(data).slice(0, 300));
-	return (data?.results?.channels?.[0]?.alternatives?.[0]?.transcript ?? "").trim();
+	return (data.results?.channels?.[0]?.alternatives?.[0]?.transcript ?? "").trim();
 }
 
 async function transcribeGroq(
@@ -266,27 +324,39 @@ async function transcribeGroq(
 	settings: VoiceToTextSettings,
 	logger: FileLogger
 ): Promise<string> {
-	const formData = new FormData();
-	formData.append("file", new Blob([wavBuffer], { type: "audio/wav" }), "audio.wav");
-	formData.append("model", settings.groqModel);
-	if (settings.language !== "auto") formData.append("language", settings.language);
-	formData.append("response_format", "json");
+	const fields: Record<string, string> = {
+		model: settings.groqModel,
+		response_format: "json",
+	};
+	if (settings.language !== "auto") fields.language = settings.language;
+
+	const { contentType, body } = buildMultipartFormData(fields, {
+		name: "file",
+		filename: "audio.wav",
+		contentType: "audio/wav",
+		data: wavBuffer,
+	});
 
 	const url = "https://api.groq.com/openai/v1/audio/transcriptions";
 	await logger.log("Sending to Groq:", url);
 
-	const response = await fetch(url, {
+	const response = await requestUrl({
+		url,
 		method: "POST",
-		headers: { Authorization: `Bearer ${settings.groqApiKey}` },
-		body: formData,
+		headers: {
+			Authorization: `Bearer ${settings.groqApiKey}`,
+			"Content-Type": contentType,
+		},
+		body,
+		throw: false,
 	});
-	if (!response.ok) {
-		const errText = await response.text();
-		throw new Error(`Groq error ${response.status}: ${errText}`);
+
+	if (response.status < 200 || response.status >= 300) {
+		throw new Error(`Groq error ${response.status}: ${response.text}`);
 	}
-	const data = await response.json();
+	const data = response.json as unknown as GroqResponse;
 	await logger.log("Groq response:", JSON.stringify(data).slice(0, 300));
-	return (data?.text ?? "").trim();
+	return (data.text ?? "").trim();
 }
 
 // ─────────────────────────────────────────────
@@ -308,7 +378,7 @@ export default class VoiceToTextPlugin extends Plugin {
 	private boundKeyDown!: (e: KeyboardEvent) => void;
 	private boundKeyUp!:   (e: KeyboardEvent) => void;
 
-	async onload() {
+	async onload(): Promise<void> {
 		await this.loadSettings();
 		this.logger = new FileLogger(
 			this.app,
@@ -329,7 +399,7 @@ export default class VoiceToTextPlugin extends Plugin {
 		await this.logger.log("Voice to Text plugin loaded. Hotkey:", this.settings.hotkey);
 	}
 
-	onunload() {
+	onunload(): void {
 		window.removeEventListener("keydown", this.boundKeyDown, true);
 		window.removeEventListener("keyup",   this.boundKeyUp,   true);
 		this.stopRecording(false);
@@ -356,15 +426,15 @@ export default class VoiceToTextPlugin extends Plugin {
 
 	// ── Key event handlers ───────────────────
 
-	private handleKeyDown(e: KeyboardEvent) {
+	private handleKeyDown(e: KeyboardEvent): void {
 		this.pressedKeys.add(e.key);
 		if (!this.isRecording && this.isHotkeyActive(e)) {
 			e.preventDefault();
-			this.startRecording();
+			void this.startRecording();
 		}
 	}
 
-	private handleKeyUp(e: KeyboardEvent) {
+	private handleKeyUp(e: KeyboardEvent): void {
 		this.pressedKeys.delete(e.key);
 		if (!this.isRecording) return;
 		const required = this.parseHotkey();
@@ -381,15 +451,15 @@ export default class VoiceToTextPlugin extends Plugin {
 
 	// ── Recording ────────────────────────────
 
-	private async startRecording() {
+	private async startRecording(): Promise<void> {
 		if (this.isRecording) return;
 		try {
 			this.stream = await navigator.mediaDevices.getUserMedia({
 				audio: { echoCancellation: true, noiseSuppression: true, sampleRate: 16000 },
 			});
-		} catch (err) {
+		} catch (err: unknown) {
 			new Notice("Voice to Text: microphone access denied.");
-			await this.logger.log("getUserMedia error:", err);
+			await this.logger.log("getUserMedia error:", errorMessage(err));
 			return;
 		}
 
@@ -410,7 +480,7 @@ export default class VoiceToTextPlugin extends Plugin {
 		await this.logger.log("Recording started");
 	}
 
-	private stopRecording(shouldTranscribe: boolean) {
+	private stopRecording(shouldTranscribe: boolean): void {
 		if (!this.isRecording || !this.mediaRecorder) return;
 		this.isRecording = false;
 		this.recordingNotice?.hide();
@@ -424,23 +494,25 @@ export default class VoiceToTextPlugin extends Plugin {
 			return;
 		}
 
-		this.mediaRecorder.onstop = async () => {
-			this.stream?.getTracks().forEach((t) => t.stop());
-			this.stream = null;
-			await this.processAudio();
+		this.mediaRecorder.onstop = () => {
+			void (async () => {
+				this.stream?.getTracks().forEach((t) => t.stop());
+				this.stream = null;
+				await this.processAudio();
+			})();
 		};
 		this.mediaRecorder.stop();
 	}
 
-	private async processAudio() {
+	private async processAudio(): Promise<void> {
 		if (this.audioChunks.length === 0) return;
 		const blob = new Blob(this.audioChunks, { type: this.audioChunks[0].type });
 		let wavBuffer: ArrayBuffer;
 		try {
 			wavBuffer = await blobToWav(blob);
-		} catch (e) {
+		} catch (e: unknown) {
 			new Notice("Voice to Text: failed to process audio.");
-			await this.logger.log("blobToWav error:", e);
+			await this.logger.log("blobToWav error:", errorMessage(e));
 			return;
 		}
 		if (this.settings.saveAudio) {
@@ -453,9 +525,9 @@ export default class VoiceToTextPlugin extends Plugin {
 			} else {
 				text = await transcribeGroq(wavBuffer, this.settings, this.logger);
 			}
-		} catch (err) {
-			new Notice(`Voice to Text: ${(err as Error).message}`);
-			await this.logger.log("Transcription error:", err);
+		} catch (err: unknown) {
+			new Notice(`Voice to Text: ${errorMessage(err)}`);
+			await this.logger.log("Transcription error:", errorMessage(err));
 			return;
 		}
 		if (!text) {
@@ -468,51 +540,55 @@ export default class VoiceToTextPlugin extends Plugin {
 
 	// ── Text insertion ────────────────────────
 
-	private insertText(text: string) {
+	private insertText(text: string): void {
 		const view = this.app.workspace.getActiveViewOfType(MarkdownView);
 		if (view?.editor) {
 			const editor: Editor = view.editor;
 			const cursor = editor.getCursor();
 			editor.replaceRange(text, cursor);
-			const lines = text.split("\n");
+			const textLines = text.split("\n");
 			editor.setCursor({
-				line: cursor.line + lines.length - 1,
-				ch: lines.length === 1
+				line: cursor.line + textLines.length - 1,
+				ch: textLines.length === 1
 					? cursor.ch + text.length
-					: lines[lines.length - 1].length,
+					: textLines[textLines.length - 1].length,
 			});
 			new Notice("Text inserted.", 2000);
 		} else {
-			navigator.clipboard.writeText(text).then(() => {
-				new Notice("Transcription copied to clipboard (no active editor).");
-			});
+			navigator.clipboard.writeText(text)
+				.then(() => {
+					new Notice("Transcription copied to clipboard (no active editor).");
+				})
+				.catch((e: unknown) => {
+					new Notice("Voice to Text: failed to copy to clipboard.");
+					void this.logger.log("Clipboard write failed:", errorMessage(e));
+				});
 		}
 	}
 
 	// ── Status bar ────────────────────────────
 
-	private updateStatusBar(recording: boolean) {
+	private updateStatusBar(recording: boolean): void {
 		if (!this.statusBarItem) return;
-		// this.statusBarItem.empty();
-		// this.statusBarItem.addClass("vtt-statusbar");
-		// this.statusBarItem.innerHTML = recording
-		// 	? `${REC_SVG}<span>Recording</span>`
-		// 	: `${MIC_SVG}<span>Voice to Text</span>`;
-		// this.statusBarItem.setAttribute(
-		// 	"title",
-		// 	recording
-		// 		? "Voice to Text: recording in progress"
-		// 		: `Voice to Text: hold ${this.settings.hotkey} to record`
-		// );
+		this.statusBarItem.empty();
+		this.statusBarItem.addClass("vtt-statusbar");
+		this.statusBarItem.setText(recording ? "Recording" : "Voice to Text");
+		this.statusBarItem.setAttribute(
+			"title",
+			recording
+				? "Voice to Text: recording in progress"
+				: `Voice to Text: hold ${this.settings.hotkey} to record`
+		);
 	}
 
 	// ── Settings persistence ──────────────────
 
-	async loadSettings() {
-		this.settings = Object.assign({}, DEFAULT_SETTINGS, await this.loadData());
+	async loadSettings(): Promise<void> {
+		const loaded = (await this.loadData()) as Partial<VoiceToTextSettings> | null;
+		this.settings = Object.assign({}, DEFAULT_SETTINGS, loaded ?? {});
 	}
 
-	async saveSettings() {
+	async saveSettings(): Promise<void> {
 		await this.saveData(this.settings);
 		this.updateStatusBar(false);
 		if (this.logger) {
@@ -528,7 +604,6 @@ export default class VoiceToTextPlugin extends Plugin {
 class VoiceToTextSettingTab extends PluginSettingTab {
 	plugin: VoiceToTextPlugin;
 	private capturingHotkey = false;
-	private capturedKeys:   Set<string> = new Set();
 	private hotkeyDisplayEl: HTMLElement | null = null;
 
 	constructor(app: App, plugin: VoiceToTextPlugin) {
@@ -538,7 +613,7 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 
 	// ── Render hotkey badges ──────────────────
 
-	private renderHotkeyBadges(container: HTMLElement, hotkey: string, placeholder = false) {
+	private renderHotkeyBadges(container: HTMLElement, hotkey: string, placeholder = false): void {
 		container.empty();
 		if (placeholder || !hotkey) {
 			container.addClass("is-empty");
@@ -551,7 +626,8 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 			const badge = container.createEl("span", { cls: "vtt-key-badge" });
 			const svg = keyIcon(key);
 			if (svg) {
-				badge.innerHTML = svg + key;
+				appendSvg(badge, svg);
+				badge.createSpan({ text: key });
 			} else {
 				badge.setText(key);
 			}
@@ -564,17 +640,17 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 	// ── Rich description helper ───────────────
 
 	private desc(parts: Array<string | { strong?: string; code?: string }>): DocumentFragment {
-		const frag = document.createDocumentFragment();
+		const frag = activeDocument.createDocumentFragment();
 		for (const p of parts) {
 			if (typeof p === "string") {
-				frag.appendText(p);
+				frag.appendChild(activeDocument.createTextNode(p));
 			} else if (p.strong) {
-				const el = document.createElement("span");
+				const el = activeDocument.createElement("span");
 				el.className = "vtt-desc-strong";
 				el.textContent = p.strong;
 				frag.appendChild(el);
 			} else if (p.code) {
-				const el = document.createElement("code");
+				const el = activeDocument.createElement("code");
 				el.className = "vtt-desc-code";
 				el.textContent = p.code;
 				frag.appendChild(el);
@@ -589,10 +665,10 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
-		containerEl.createEl("h2", { text: "Voice to Text" });
+		new Setting(containerEl).setName("Voice to Text").setHeading();
 
 		// ─── Provider ─────────────────────────
-		containerEl.createEl("h3", { text: "Provider", cls: "vtt-section-heading" });
+		new Setting(containerEl).setName("Provider").setHeading();
 
 		new Setting(containerEl)
 			.setName("Speech-to-text provider")
@@ -608,16 +684,18 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 					.addOption("deepgram", "Deepgram")
 					.addOption("groq", "Groq (Whisper)")
 					.setValue(this.plugin.settings.provider)
-					.onChange(async (value) => {
-						this.plugin.settings.provider = value as Provider;
-						await this.plugin.saveSettings();
-						this.display();
+					.onChange((value) => {
+						void (async () => {
+							this.plugin.settings.provider = value as Provider;
+							await this.plugin.saveSettings();
+							this.display();
+						})();
 					})
 			);
 
 		// ─── Deepgram ─────────────────────────
 		if (this.plugin.settings.provider === "deepgram") {
-			containerEl.createEl("h3", { text: "Deepgram", cls: "vtt-section-heading" });
+			new Setting(containerEl).setName("Deepgram").setHeading();
 
 			new Setting(containerEl)
 				.setClass("vtt-api-key-row")
@@ -632,9 +710,11 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 					text
 						.setPlaceholder("033215ef…")
 						.setValue(this.plugin.settings.deepgramApiKey)
-						.onChange(async (value) => {
-							this.plugin.settings.deepgramApiKey = value.trim();
-							await this.plugin.saveSettings();
+						.onChange((value) => {
+							void (async () => {
+								this.plugin.settings.deepgramApiKey = value.trim();
+								await this.plugin.saveSettings();
+							})();
 						})
 				);
 
@@ -651,16 +731,18 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 					);
 					return dd
 						.setValue(this.plugin.settings.deepgramModel)
-						.onChange(async (value) => {
-							this.plugin.settings.deepgramModel = value;
-							await this.plugin.saveSettings();
+						.onChange((value) => {
+							void (async () => {
+								this.plugin.settings.deepgramModel = value;
+								await this.plugin.saveSettings();
+							})();
 						});
 				});
 		}
 
 		// ─── Groq ─────────────────────────────
 		if (this.plugin.settings.provider === "groq") {
-			containerEl.createEl("h3", { text: "Groq (Whisper)", cls: "vtt-section-heading" });
+			new Setting(containerEl).setName("Groq (Whisper)").setHeading();
 
 			new Setting(containerEl)
 				.setClass("vtt-api-key-row")
@@ -675,9 +757,11 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 					text
 						.setPlaceholder("gsk_…")
 						.setValue(this.plugin.settings.groqApiKey)
-						.onChange(async (value) => {
-							this.plugin.settings.groqApiKey = value.trim();
-							await this.plugin.saveSettings();
+						.onChange((value) => {
+							void (async () => {
+								this.plugin.settings.groqApiKey = value.trim();
+								await this.plugin.saveSettings();
+							})();
 						})
 				);
 
@@ -696,15 +780,17 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 					);
 					return dd
 						.setValue(this.plugin.settings.groqModel)
-						.onChange(async (value) => {
-							this.plugin.settings.groqModel = value;
-							await this.plugin.saveSettings();
+						.onChange((value) => {
+							void (async () => {
+								this.plugin.settings.groqModel = value;
+								await this.plugin.saveSettings();
+							})();
 						});
 				});
 		}
 
 		// ─── Language ─────────────────────────
-		containerEl.createEl("h3", { text: "Language", cls: "vtt-section-heading" });
+		new Setting(containerEl).setName("Language").setHeading();
 
 		new Setting(containerEl)
 			.setName("Transcription language")
@@ -719,14 +805,16 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 				);
 				return dd
 					.setValue(this.plugin.settings.language)
-					.onChange(async (value) => {
-						this.plugin.settings.language = value;
-						await this.plugin.saveSettings();
+					.onChange((value) => {
+						void (async () => {
+							this.plugin.settings.language = value;
+							await this.plugin.saveSettings();
+						})();
 					});
 			});
 
 		// ─── Hotkey ───────────────────────────
-		containerEl.createEl("h3", { text: "Push-to-talk hotkey", cls: "vtt-section-heading" });
+		new Setting(containerEl).setName("Push-to-talk hotkey").setHeading();
 
 		const hotkeyRow = new Setting(containerEl)
 			.setName("Hotkey")
@@ -745,17 +833,18 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 			? "Press your key combination now…"
 			: "Click the field above to capture");
 
-		const clearBtn = hotkeyWrap.createEl("button", { text: "Clear" });
-		clearBtn.style.cssText = "font-size:12px;padding:2px 8px;";
-		clearBtn.onclick = async () => {
-			this.plugin.settings.hotkey = "";
-			await this.plugin.saveSettings();
-			this.renderHotkeyBadges(displayEl, "", true);
+		const clearBtn = hotkeyWrap.createEl("button", { text: "Clear", cls: "vtt-clear-btn" });
+		clearBtn.onclick = () => {
+			void (async () => {
+				this.plugin.settings.hotkey = "";
+				await this.plugin.saveSettings();
+				this.renderHotkeyBadges(displayEl, "", true);
+			})();
 		};
 
 		// Capture logic
 		let capturedSet: Set<string> = new Set();
-		let captureTimeout: ReturnType<typeof setTimeout> | null = null;
+		let captureTimeout: number | null = null;
 
 		const startCapture = () => {
 			this.capturingHotkey = true;
@@ -767,25 +856,27 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 			hintEl.setText("Hold your combination, then release.");
 		};
 
-		const finishCapture = async (keys: Set<string>) => {
-			this.capturingHotkey = false;
-			displayEl.removeClass("is-capturing");
-			if (keys.size === 0) {
-				this.renderHotkeyBadges(displayEl, this.plugin.settings.hotkey);
+		const finishCapture = (keys: Set<string>) => {
+			void (async () => {
+				this.capturingHotkey = false;
+				displayEl.removeClass("is-capturing");
+				if (keys.size === 0) {
+					this.renderHotkeyBadges(displayEl, this.plugin.settings.hotkey);
+					hintEl.setText("Click the field above to capture");
+					return;
+				}
+				// Prefer modifier ordering: Meta, Control, Alt, Shift, then others
+				const order = ["Meta", "Control", "Alt", "Shift"];
+				const sorted = [
+					...order.filter((k) => keys.has(k)),
+					...[...keys].filter((k) => !order.includes(k)),
+				];
+				const hotkey = sorted.join("+");
+				this.plugin.settings.hotkey = hotkey;
+				await this.plugin.saveSettings();
+				this.renderHotkeyBadges(displayEl, hotkey);
 				hintEl.setText("Click the field above to capture");
-				return;
-			}
-			// Prefer modifier ordering: Meta, Control, Alt, Shift, then others
-			const order = ["Meta", "Control", "Alt", "Shift"];
-			const sorted = [
-				...order.filter((k) => keys.has(k)),
-				...[...keys].filter((k) => !order.includes(k)),
-			];
-			const hotkey = sorted.join("+");
-			this.plugin.settings.hotkey = hotkey;
-			await this.plugin.saveSettings();
-			this.renderHotkeyBadges(displayEl, hotkey);
-			hintEl.setText("Click the field above to capture");
+			})();
 		};
 
 		displayEl.addEventListener("click", (e) => {
@@ -809,12 +900,12 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 			displayEl.addClass("is-capturing");
 		}, true);
 
-		displayEl.addEventListener("keyup", async (e: KeyboardEvent) => {
+		displayEl.addEventListener("keyup", (e: KeyboardEvent) => {
 			if (!this.capturingHotkey) return;
 			e.preventDefault();
 			// On first key release, commit
-			if (captureTimeout) clearTimeout(captureTimeout);
-			captureTimeout = setTimeout(() => finishCapture(capturedSet), 150);
+			if (captureTimeout) window.clearTimeout(captureTimeout);
+			captureTimeout = window.setTimeout(() => finishCapture(capturedSet), 150);
 		}, true);
 
 		displayEl.setAttribute("tabindex", "0");
@@ -828,10 +919,10 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 				hintEl.setText("Click the field above to capture");
 			}
 		};
-		document.addEventListener("click", cancelCapture, { once: true });
+		activeDocument.addEventListener("click", cancelCapture, { once: true });
 
 		// ─── Logging ──────────────────────────
-		containerEl.createEl("h3", { text: "Logging", cls: "vtt-section-heading" });
+		new Setting(containerEl).setName("Logging").setHeading();
 
 		new Setting(containerEl)
 			.setName("Enable file logging")
@@ -843,10 +934,12 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.loggingEnabled)
-					.onChange(async (value) => {
-						this.plugin.settings.loggingEnabled = value;
-						await this.plugin.saveSettings();
-						this.display();
+					.onChange((value) => {
+						void (async () => {
+							this.plugin.settings.loggingEnabled = value;
+							await this.plugin.saveSettings();
+							this.display();
+						})();
 					})
 			);
 
@@ -862,15 +955,17 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 					text
 						.setPlaceholder("voice-to-text-logs")
 						.setValue(this.plugin.settings.logFolder)
-						.onChange(async (value) => {
-							this.plugin.settings.logFolder = value.trim() || "voice-to-text-logs";
-							await this.plugin.saveSettings();
+						.onChange((value) => {
+							void (async () => {
+								this.plugin.settings.logFolder = value.trim() || "voice-to-text-logs";
+								await this.plugin.saveSettings();
+							})();
 						})
 				);
 		}
 
 		// ─── Audio saving ─────────────────────
-		containerEl.createEl("h3", { text: "Audio", cls: "vtt-section-heading" });
+		new Setting(containerEl).setName("Audio").setHeading();
 
 		new Setting(containerEl)
 			.setName("Save recordings")
@@ -882,10 +977,12 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 			.addToggle((toggle) =>
 				toggle
 					.setValue(this.plugin.settings.saveAudio)
-					.onChange(async (value) => {
-						this.plugin.settings.saveAudio = value;
-						await this.plugin.saveSettings();
-						this.display();
+					.onChange((value) => {
+						void (async () => {
+							this.plugin.settings.saveAudio = value;
+							await this.plugin.saveSettings();
+							this.display();
+						})();
 					})
 			);
 
@@ -901,15 +998,17 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 					text
 						.setPlaceholder("voice-recordings")
 						.setValue(this.plugin.settings.audioSaveFolder)
-						.onChange(async (value) => {
-							this.plugin.settings.audioSaveFolder = value.trim() || "voice-recordings";
-							await this.plugin.saveSettings();
+						.onChange((value) => {
+							void (async () => {
+								this.plugin.settings.audioSaveFolder = value.trim() || "voice-recordings";
+								await this.plugin.saveSettings();
+							})();
 						})
 				);
 		}
 
 		// ─── Status ───────────────────────────
-		containerEl.createEl("h3", { text: "Status", cls: "vtt-section-heading" });
+		new Setting(containerEl).setName("Status").setHeading();
 
 		const statusDiv = containerEl.createDiv({ cls: "vtt-status-block" });
 		statusDiv.createEl("p", {

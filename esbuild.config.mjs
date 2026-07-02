@@ -1,6 +1,10 @@
 import esbuild from "esbuild";
 import process from "process";
-import builtins from "builtin-modules";
+
+const builtins = [
+	"assert", "buffer", "child_process", "crypto", "events", "fs", "http",
+	"https", "net", "os", "path", "stream", "tls", "tty", "url", "util", "zlib",
+];
 
 const banner =
 `/*

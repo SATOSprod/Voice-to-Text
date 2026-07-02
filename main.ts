@@ -665,7 +665,7 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 		const { containerEl } = this;
 		containerEl.empty();
 
-		new Setting(containerEl).setName("Voice to Text").setHeading();
+		new Setting(containerEl).setName("General").setHeading();
 
 		// ─── Provider ─────────────────────────
 		new Setting(containerEl).setName("Provider").setHeading();
@@ -726,9 +726,9 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 					" is the most accurate general-purpose model.",
 				]))
 				.addDropdown((dd) => {
-					Object.entries(DEEPGRAM_MODELS).forEach(([val, label]) =>
-						dd.addOption(val, label)
-					);
+					Object.entries(DEEPGRAM_MODELS).forEach(([val, label]) => {
+						dd.addOption(val, label);
+					});
 					return dd
 						.setValue(this.plugin.settings.deepgramModel)
 						.onChange((value) => {
@@ -775,9 +775,9 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 					" is more accurate.",
 				]))
 				.addDropdown((dd) => {
-					Object.entries(GROQ_MODELS).forEach(([val, label]) =>
-						dd.addOption(val, label)
-					);
+					Object.entries(GROQ_MODELS).forEach(([val, label]) => {
+						dd.addOption(val, label);
+					});
 					return dd
 						.setValue(this.plugin.settings.groqModel)
 						.onChange((value) => {
@@ -800,9 +800,9 @@ class VoiceToTextSettingTab extends PluginSettingTab {
 				" lets the provider detect it automatically — slightly slower.",
 			]))
 			.addDropdown((dd) => {
-				Object.entries(LANGUAGES).forEach(([val, label]) =>
-					dd.addOption(val, label)
-				);
+				Object.entries(LANGUAGES).forEach(([val, label]) => {
+					dd.addOption(val, label);
+				});
 				return dd
 					.setValue(this.plugin.settings.language)
 					.onChange((value) => {
